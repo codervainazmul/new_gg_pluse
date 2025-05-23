@@ -9,7 +9,7 @@ app = FastAPI()
 # Allow CORS from any origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["https://seraprogrammer.com"], # Allow all origins
     allow_credentials=True,
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
