@@ -4,12 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from g4f.client import Client
 import asyncio
-import json
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 app = FastAPI()
 
@@ -22,7 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = Client()
+# Create a thread pool for blocking operations
+executor = ThreadPoolExecutor(max_workers=10)
 
 class PromptRequest(BaseModel):
     model: str
@@ -30,154 +27,152 @@ class PromptRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(request: PromptRequest):
-    def generate():  # Make this sync, not async
-        try:
-            logger.info(f"Attempting to chat with model: {request.model}")
-            logger.info(f"Prompt: {request.prompt}")
-            
-            # Try streaming first
+    async def generate():
+        # Create a queue to communicate between threads
+        import queue
+        content_queue = queue.Queue()
+        error_queue = queue.Queue()
+        
+        def stream_chat():
             try:
+                client = Client()  # Create client in the thread
                 chat_completion = client.chat.completions.create(
                     model=request.model,
-                    messages=[{"role": "user", "content": request.prompt}],
+                    messages=[{"role": "user", "content": request.prompt}], 
                     stream=True
                 )
                 
-                logger.info("Got chat completion object, starting to iterate...")
-                chunk_count = 0
-                total_content = ""
+                for completion in chat_completion:
+                    content = completion.choices[0].delta.content or ""
+                    if content:
+                        content_queue.put(("content", content))
                 
-                for chunk in chat_completion:
-                    chunk_count += 1
-                    logger.info(f"Processing chunk {chunk_count}: {type(chunk)}")
-                    
-                    content = None
-                    
-                    try:
-                        # Debug: Print the chunk structure
-                        logger.info(f"Chunk attributes: {dir(chunk)}")
-                        
-                        # Try different ways to extract content
-                        if hasattr(chunk, 'choices') and chunk.choices:
-                            choice = chunk.choices[0]
-                            logger.info(f"Choice attributes: {dir(choice)}")
-                            
-                            if hasattr(choice, 'delta') and choice.delta:
-                                if hasattr(choice.delta, 'content') and choice.delta.content:
-                                    content = choice.delta.content
-                                    logger.info(f"Found delta content: {repr(content)}")
-                            elif hasattr(choice, 'text') and choice.text:
-                                content = choice.text
-                                logger.info(f"Found choice text: {repr(content)}")
-                            elif hasattr(choice, 'message') and choice.message and hasattr(choice.message, 'content'):
-                                content = choice.message.content
-                                logger.info(f"Found message content: {repr(content)}")
-                        
-                        # Alternative: direct content
-                        elif hasattr(chunk, 'content') and chunk.content:
-                            content = chunk.content
-                            logger.info(f"Found direct content: {repr(content)}")
-                        
-                        # Alternative: text attribute
-                        elif hasattr(chunk, 'text') and chunk.text:
-                            content = chunk.text
-                            logger.info(f"Found text attribute: {repr(content)}")
-                        
-                        if content:
-                            total_content += content
-                            yield content
-                        else:
-                            logger.warning(f"No content found in chunk {chunk_count}")
-                            
-                    except Exception as chunk_error:
-                        logger.error(f"Error processing chunk {chunk_count}: {chunk_error}")
-                        continue
+                content_queue.put(("done", None))
                 
-                logger.info(f"Finished streaming. Total chunks: {chunk_count}, Total content length: {len(total_content)}")
+            except Exception as e:
+                error_queue.put(str(e))
+                content_queue.put(("error", str(e)))
+        
+        # Start the streaming in a separate thread
+        thread = threading.Thread(target=stream_chat)
+        thread.daemon = True
+        thread.start()
+        
+        # Yield content as it comes
+        while True:
+            try:
+                # Check for content with a timeout
+                item_type, content = content_queue.get(timeout=0.1)
                 
-                # If we got no content at all, try the fallback
-                if chunk_count == 0 or not total_content.strip():
-                    logger.warning("No content received from streaming, trying fallback...")
-                    raise Exception("No content received from streaming")
+                if item_type == "content":
+                    yield content
+                elif item_type == "done":
+                    break
+                elif item_type == "error":
+                    yield f"Error: {content}"
+                    break
                     
-            except Exception as streaming_error:
-                logger.error(f"Streaming failed: {streaming_error}")
-                logger.info("Trying non-streaming fallback...")
-                
-                # Fallback to non-streaming
-                try:
-                    chat_completion = client.chat.completions.create(
-                        model=request.model,
-                        messages=[{"role": "user", "content": request.prompt}],
-                        stream=False
-                    )
-                    
-                    logger.info("Got non-streaming response")
-                    
-                    # Extract the full response
-                    if hasattr(chat_completion, 'choices') and chat_completion.choices:
-                        choice = chat_completion.choices[0]
-                        if hasattr(choice, 'message') and choice.message and hasattr(choice.message, 'content'):
-                            full_response = choice.message.content
-                        elif hasattr(choice, 'text'):
-                            full_response = choice.text
-                        else:
-                            full_response = str(choice)
-                    else:
-                        full_response = str(chat_completion)
-                    
-                    logger.info(f"Full response length: {len(full_response)}")
-                    
-                    # Stream it character by character
-                    for char in full_response:
-                        yield char
-                        
-                except Exception as fallback_error:
-                    logger.error(f"Fallback also failed: {fallback_error}")
-                    yield f"Error: Both streaming and non-streaming failed. Model: {request.model}, Error: {str(fallback_error)}"
-                    
-        except Exception as e:
-            logger.error(f"Overall error: {e}")
-            yield f"Critical Error: {str(e)}"
+            except queue.Empty:
+                # Check if thread is still alive
+                if not thread.is_alive():
+                    # Thread died, check for errors
+                    if not error_queue.empty():
+                        error = error_queue.get()
+                        yield f"Thread Error: {error}"
+                    break
+                # Continue waiting
+                await asyncio.sleep(0.01)
     
     return StreamingResponse(generate(), media_type="text/plain")
 
-# Add a simple test endpoint
+# Alternative approach using asyncio.to_thread (Python 3.9+)
+@app.post("/chat-v2")
+async def chat_v2(request: PromptRequest):
+    async def generate():
+        try:
+            # Run the blocking g4f call in a thread pool
+            def sync_stream():
+                client = Client()
+                return client.chat.completions.create(
+                    model=request.model,
+                    messages=[{"role": "user", "content": request.prompt}], 
+                    stream=True
+                )
+            
+            # Get the completion object
+            chat_completion = await asyncio.get_event_loop().run_in_executor(
+                executor, sync_stream
+            )
+            
+            # Now iterate through it
+            def get_next_chunk(completion_iter):
+                try:
+                    return next(completion_iter)
+                except StopIteration:
+                    return None
+                except Exception as e:
+                    raise e
+            
+            # Convert to iterator
+            completion_iter = iter(chat_completion)
+            
+            while True:
+                # Get next chunk in thread pool
+                chunk = await asyncio.get_event_loop().run_in_executor(
+                    executor, get_next_chunk, completion_iter
+                )
+                
+                if chunk is None:
+                    break
+                    
+                content = chunk.choices[0].delta.content or ""
+                if content:
+                    yield content
+                    
+        except Exception as e:
+            yield f"Error: {str(e)}"
+    
+    return StreamingResponse(generate(), media_type="text/plain")
+
+# Simple approach - collect all then stream
+@app.post("/chat-v3")
+async def chat_v3(request: PromptRequest):
+    async def generate():
+        def get_full_response():
+            client = Client()
+            chat_completion = client.chat.completions.create(
+                model=request.model,
+                messages=[{"role": "user", "content": request.prompt}], 
+                stream=True
+            )
+            
+            full_text = ""
+            for completion in chat_completion:
+                content = completion.choices[0].delta.content or ""
+                full_text += content
+            
+            return full_text
+        
+        try:
+            # Get the full response in a thread
+            full_response = await asyncio.get_event_loop().run_in_executor(
+                executor, get_full_response
+            )
+            
+            # Stream it character by character
+            for char in full_response:
+                yield char
+                await asyncio.sleep(0.01)  # Small delay for streaming effect
+                
+        except Exception as e:
+            yield f"Error: {str(e)}"
+    
+    return StreamingResponse(generate(), media_type="text/plain")
+
+# Test endpoint
 @app.get("/test")
 async def test():
     return {"message": "Server is running"}
-
-# Add a debug endpoint to test model without streaming
-@app.post("/debug")
-async def debug_model(request: PromptRequest):
-    try:
-        logger.info(f"Debug testing model: {request.model}")
-        
-        # Try non-streaming first
-        chat_completion = client.chat.completions.create(
-            model=request.model,
-            messages=[{"role": "user", "content": request.prompt}],
-            stream=False
-        )
-        
-        logger.info("Debug: Got response")
-        logger.info(f"Debug: Response type: {type(chat_completion)}")
-        logger.info(f"Debug: Response attributes: {dir(chat_completion)}")
-        
-        return {
-            "success": True,
-            "response_type": str(type(chat_completion)),
-            "response_str": str(chat_completion),
-            "has_choices": hasattr(chat_completion, 'choices'),
-            "choices_len": len(chat_completion.choices) if hasattr(chat_completion, 'choices') else 0
-        }
-        
-    except Exception as e:
-        logger.error(f"Debug error: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
 
 if __name__ == "__main__":
     import uvicorn
