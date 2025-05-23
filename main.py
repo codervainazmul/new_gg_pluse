@@ -5,6 +5,11 @@ from pydantic import BaseModel
 from g4f.client import Client
 import asyncio
 import json
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -25,140 +30,155 @@ class PromptRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(request: PromptRequest):
-    async def generate():
+    def generate():  # Make this sync, not async
         try:
-            # First, try to determine if this is a reasoning model
-            is_reasoning_model = any(keyword in request.model.lower() for keyword in 
-                                   ['deepseek-r1', 'r1', 'reasoning', 'think'])
+            logger.info(f"Attempting to chat with model: {request.model}")
+            logger.info(f"Prompt: {request.prompt}")
             
-            # For reasoning models, try streaming with special handling
-            if is_reasoning_model:
-                try:
-                    # Method for reasoning models - sometimes they need different handling
-                    chat_completion = client.chat.completions.create(
-                        model=request.model,
-                        messages=[{"role": "user", "content": request.prompt}],
-                        stream=True,
-                        temperature=0.7  # Some reasoning models work better with explicit temperature
-                    )
-                    
-                    buffer = ""
-                    chunk_count = 0
-                    
-                    for chunk in chat_completion:
-                        chunk_count += 1
-                        try:
-                            # Multiple ways to extract content from chunk
-                            content = None
-                            
-                            # Method 1: Standard OpenAI format
-                            if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                                if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
-                                    content = chunk.choices[0].delta.content
-                                # Sometimes content is directly in choice
-                                elif hasattr(chunk.choices[0], 'text'):
-                                    content = chunk.choices[0].text
-                                elif hasattr(chunk.choices[0], 'message') and hasattr(chunk.choices[0].message, 'content'):
-                                    content = chunk.choices[0].message.content
-                            
-                            # Method 2: Direct content attribute
-                            elif hasattr(chunk, 'content'):
-                                content = chunk.content
-                            
-                            # Method 3: Text attribute
-                            elif hasattr(chunk, 'text'):
-                                content = chunk.text
-                            
-                            # Method 4: String conversion as fallback
-                            elif isinstance(chunk, str):
-                                content = chunk
-                            
-                            if content:
-                                buffer += content
-                                yield content
-                                await asyncio.sleep(0.01)
-                                
-                        except Exception as chunk_error:
-                            print(f"Reasoning model chunk error: {chunk_error}")
-                            continue
-                    
-                    # If no chunks were processed, try fallback
-                    if chunk_count == 0:
-                        raise Exception("No chunks received from reasoning model")
-                        
-                except Exception as reasoning_error:
-                    print(f"Reasoning model streaming failed: {reasoning_error}")
-                    # Fallback to non-streaming for reasoning models
-                    try:
-                        chat_completion = client.chat.completions.create(
-                            model=request.model,
-                            messages=[{"role": "user", "content": request.prompt}],
-                            stream=False
-                        )
-                        
-                        # Extract response and stream it
-                        if hasattr(chat_completion, 'choices') and len(chat_completion.choices) > 0:
-                            full_response = chat_completion.choices[0].message.content
-                            # Stream character by character for smooth effect
-                            for char in full_response:
-                                yield char
-                                await asyncio.sleep(0.02)
-                        else:
-                            yield "No response received from reasoning model"
-                            
-                    except Exception as fallback_error:
-                        yield f"Reasoning model error: {str(fallback_error)}"
-            
-            else:
-                # Standard streaming for regular models
+            # Try streaming first
+            try:
                 chat_completion = client.chat.completions.create(
                     model=request.model,
                     messages=[{"role": "user", "content": request.prompt}],
                     stream=True
                 )
                 
+                logger.info("Got chat completion object, starting to iterate...")
+                chunk_count = 0
+                total_content = ""
+                
                 for chunk in chat_completion:
+                    chunk_count += 1
+                    logger.info(f"Processing chunk {chunk_count}: {type(chunk)}")
+                    
+                    content = None
+                    
                     try:
-                        content = None
+                        # Debug: Print the chunk structure
+                        logger.info(f"Chunk attributes: {dir(chunk)}")
                         
-                        # Standard extraction methods
-                        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                            delta = chunk.choices[0].delta
-                            if hasattr(delta, 'content') and delta.content:
-                                content = delta.content
-                            elif hasattr(chunk.choices[0], 'text'):
-                                content = chunk.choices[0].text
+                        # Try different ways to extract content
+                        if hasattr(chunk, 'choices') and chunk.choices:
+                            choice = chunk.choices[0]
+                            logger.info(f"Choice attributes: {dir(choice)}")
+                            
+                            if hasattr(choice, 'delta') and choice.delta:
+                                if hasattr(choice.delta, 'content') and choice.delta.content:
+                                    content = choice.delta.content
+                                    logger.info(f"Found delta content: {repr(content)}")
+                            elif hasattr(choice, 'text') and choice.text:
+                                content = choice.text
+                                logger.info(f"Found choice text: {repr(content)}")
+                            elif hasattr(choice, 'message') and choice.message and hasattr(choice.message, 'content'):
+                                content = choice.message.content
+                                logger.info(f"Found message content: {repr(content)}")
                         
-                        # Alternative extraction methods
-                        elif hasattr(chunk, 'content'):
+                        # Alternative: direct content
+                        elif hasattr(chunk, 'content') and chunk.content:
                             content = chunk.content
-                        elif hasattr(chunk, 'text'):
+                            logger.info(f"Found direct content: {repr(content)}")
+                        
+                        # Alternative: text attribute
+                        elif hasattr(chunk, 'text') and chunk.text:
                             content = chunk.text
+                            logger.info(f"Found text attribute: {repr(content)}")
                         
                         if content:
+                            total_content += content
                             yield content
-                            await asyncio.sleep(0.01)
+                        else:
+                            logger.warning(f"No content found in chunk {chunk_count}")
                             
                     except Exception as chunk_error:
-                        print(f"Standard model chunk error: {chunk_error}")
+                        logger.error(f"Error processing chunk {chunk_count}: {chunk_error}")
                         continue
-                        
-        except Exception as e:
-            print(f"Overall streaming error: {e}")
-            # Final fallback - try one more time with basic approach
-            try:
-                chat_completion = client.chat.completions.create(
-                    model=request.model,
-                    messages=[{"role": "user", "content": request.prompt}],
-                    stream=False
-                )
                 
-                response_text = str(chat_completion.choices[0].message.content)
-                for char in response_text:
-                    yield char
-                    await asyncio.sleep(0.03)
+                logger.info(f"Finished streaming. Total chunks: {chunk_count}, Total content length: {len(total_content)}")
+                
+                # If we got no content at all, try the fallback
+                if chunk_count == 0 or not total_content.strip():
+                    logger.warning("No content received from streaming, trying fallback...")
+                    raise Exception("No content received from streaming")
                     
-            except Exception as final_error:
-                yield f"Error: Unable to get response from {request.model}. Error: {str(final_error)}"
+            except Exception as streaming_error:
+                logger.error(f"Streaming failed: {streaming_error}")
+                logger.info("Trying non-streaming fallback...")
+                
+                # Fallback to non-streaming
+                try:
+                    chat_completion = client.chat.completions.create(
+                        model=request.model,
+                        messages=[{"role": "user", "content": request.prompt}],
+                        stream=False
+                    )
+                    
+                    logger.info("Got non-streaming response")
+                    
+                    # Extract the full response
+                    if hasattr(chat_completion, 'choices') and chat_completion.choices:
+                        choice = chat_completion.choices[0]
+                        if hasattr(choice, 'message') and choice.message and hasattr(choice.message, 'content'):
+                            full_response = choice.message.content
+                        elif hasattr(choice, 'text'):
+                            full_response = choice.text
+                        else:
+                            full_response = str(choice)
+                    else:
+                        full_response = str(chat_completion)
+                    
+                    logger.info(f"Full response length: {len(full_response)}")
+                    
+                    # Stream it character by character
+                    for char in full_response:
+                        yield char
+                        
+                except Exception as fallback_error:
+                    logger.error(f"Fallback also failed: {fallback_error}")
+                    yield f"Error: Both streaming and non-streaming failed. Model: {request.model}, Error: {str(fallback_error)}"
+                    
+        except Exception as e:
+            logger.error(f"Overall error: {e}")
+            yield f"Critical Error: {str(e)}"
     
     return StreamingResponse(generate(), media_type="text/plain")
+
+# Add a simple test endpoint
+@app.get("/test")
+async def test():
+    return {"message": "Server is running"}
+
+# Add a debug endpoint to test model without streaming
+@app.post("/debug")
+async def debug_model(request: PromptRequest):
+    try:
+        logger.info(f"Debug testing model: {request.model}")
+        
+        # Try non-streaming first
+        chat_completion = client.chat.completions.create(
+            model=request.model,
+            messages=[{"role": "user", "content": request.prompt}],
+            stream=False
+        )
+        
+        logger.info("Debug: Got response")
+        logger.info(f"Debug: Response type: {type(chat_completion)}")
+        logger.info(f"Debug: Response attributes: {dir(chat_completion)}")
+        
+        return {
+            "success": True,
+            "response_type": str(type(chat_completion)),
+            "response_str": str(chat_completion),
+            "has_choices": hasattr(chat_completion, 'choices'),
+            "choices_len": len(chat_completion.choices) if hasattr(chat_completion, 'choices') else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug error: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
